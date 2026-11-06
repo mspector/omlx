@@ -7908,6 +7908,58 @@ async def probe_cache(
     cached_blocks = blocks_ssd_hot + blocks_ssd_disk
     blocks_cold = max(total_blocks - cached_blocks, 0)
 
+    # The walk the chat route makes: full blocks through the paged cache's
+    # block map, falling back to the SSD index, then one partial tail block
+    # under the last matched parent. Read-only, so the probe neither
+    # registers blocks nor counts as a hit; the figure it reports is the
+    # cached count the reply will carry.
+    live_hit_tokens = 0
+    live_blocks = 0
+    live_tail_tokens = 0
+    live_pinned_blocks = 0
+    pinned = (
+        ssd_manager.pinned_block_hashes()
+        if ssd_manager is not None and hasattr(ssd_manager, "pinned_block_hashes")
+        else set()
+    )
+    if paged_cache is not None:
+        block_map = getattr(paged_cache, "cached_block_hash_to_block", None)
+
+        def held(h: bytes) -> bool:
+            if block_map is not None and block_map.get_block(h) is not None:
+                return True
+            return ssd_manager is not None and ssd_manager.has_block(h)
+
+        parent: bytes | None = None
+        for start in range(0, total_tokens - total_tokens % block_size, block_size):
+            h = compute_block_hash(
+                parent, token_ids[start : start + block_size],
+                extra_keys=None, model_name=model_name,
+            )
+            if not held(h):
+                break
+            live_blocks += 1
+            live_hit_tokens += block_size
+            if h in pinned:
+                live_pinned_blocks += 1
+            parent = h
+        tails = getattr(paged_cache, "_tail_index", {}).get(parent)
+        if tails and live_hit_tokens < total_tokens:
+            remaining = total_tokens - live_hit_tokens
+            for tail_hash, length in sorted(tails.items(), key=lambda kv: -kv[1]):
+                if length > remaining:
+                    continue
+                h = compute_block_hash(
+                    parent, token_ids[live_hit_tokens : live_hit_tokens + length],
+                    extra_keys=None, model_name=model_name,
+                )
+                if h == tail_hash and held(h):
+                    live_tail_tokens = length
+                    live_hit_tokens += length
+                    if h in pinned:
+                        live_pinned_blocks += 1
+                    break
+
     return {
         "model_id": request.model_id,
         "model_loaded": True,
@@ -7919,6 +7971,51 @@ async def probe_cache(
         "blocks_cold": blocks_cold,
         "ssd_hit_tokens": ssd_hit_tokens,
         "cold_tokens": max(total_tokens - ssd_hit_tokens, 0),
+        "live_hit_tokens": live_hit_tokens,
+        "live_blocks": live_blocks,
+        "live_tail_tokens": live_tail_tokens,
+        "live_cold_tokens": max(total_tokens - live_hit_tokens, 0),
+        "live_pinned_blocks": live_pinned_blocks,
+        "pinned_blocks_total": len(pinned),
+    }
+
+
+def _ssd_managers() -> list[tuple[str, Any]]:
+    """Every loaded model's SSD cache manager, by model id."""
+    out: list[tuple[str, Any]] = []
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        return out
+    for model_id, entry in engine_pool._entries.items():
+        engine = getattr(entry, "engine", None)
+        async_core = getattr(engine, "_engine", None)
+        core = getattr(async_core, "engine", None) if async_core is not None else None
+        scheduler = getattr(core, "scheduler", None) if core is not None else None
+        manager = getattr(scheduler, "paged_ssd_cache_manager", None)
+        if manager is not None and hasattr(manager, "pinned_block_hashes"):
+            out.append((model_id, manager))
+    return out
+
+
+@router.get("/api/cache/pins")
+async def list_cache_pins(is_admin: bool = Depends(require_admin)):
+    """How many blocks each loaded model holds pinned against SSD eviction."""
+    return {
+        "models": [
+            {"model_id": model_id, "pinned_blocks": len(manager.pinned_block_hashes())}
+            for model_id, manager in _ssd_managers()
+        ]
+    }
+
+
+@router.delete("/api/cache/pins")
+async def clear_cache_pins(is_admin: bool = Depends(require_admin)):
+    """Drop every pin on every loaded model."""
+    return {
+        "models": [
+            {"model_id": model_id, "unpinned_blocks": manager.unpin_all()}
+            for model_id, manager in _ssd_managers()
+        ]
     }
 
 
