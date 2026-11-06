@@ -2895,6 +2895,7 @@ class Scheduler:
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
         system_store: tuple[list[int], list[Any], Any, Any] | None = None,
+        pin_cache: bool = False,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -2967,6 +2968,22 @@ class Scheduler:
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
+            if (
+                pin_cache
+                and block_table
+                and self.paged_cache_manager is not None
+                and self.paged_ssd_cache_manager is not None
+            ):
+                hashes = []
+                for block_id in block_table.block_ids:
+                    block = self.paged_cache_manager.blocks[block_id]
+                    if block.block_hash is not None:
+                        hashes.append(bytes(block.block_hash))
+                total = self.paged_ssd_cache_manager.pin_blocks(hashes)
+                logger.info(
+                    "Pinned %d blocks for %s (%d pinned in all)",
+                    len(hashes), request_id, total,
+                )
             if block_table and self.paged_cache_manager is not None:
                 self.paged_cache_manager.release_for_eviction(block_table.block_ids)
             if self.block_aware_cache is not None:
@@ -12525,6 +12542,7 @@ class Scheduler:
                 request.vlm_extra_key_token_start_for_cache,
                 request.vlm_extra_key_ranges_for_cache,
                 not self._bypass_hot_cache_under_pressure(),
+                pin_cache=getattr(request, "pin_cache", False),
             )
         except BaseException:
             if gate is not None:
@@ -14782,6 +14800,7 @@ class Scheduler:
                                         request.vlm_extra_key_ranges_for_cache,
                                         hot_cache_write_back,
                                         system_store,
+                                        pin_cache=getattr(request, "pin_cache", False),
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -14816,6 +14835,7 @@ class Scheduler:
                                     request.vlm_extra_key_ranges_for_cache,
                                     hot_cache_write_back,
                                     system_store,
+                                    pin_cache=getattr(request, "pin_cache", False),
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "

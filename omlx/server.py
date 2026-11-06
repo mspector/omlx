@@ -2119,13 +2119,20 @@ def _ignore_eos_kwargs(request) -> dict[str, bool]:
 
 # `off` keeps a one-shot request out of the prefix cache; lookups still run.
 _CACHE_STORE_HEADER = "X-oMLX-Cache-Store"
+# `on` pins the request's blocks against the SSD size cap once stored.
+_CACHE_PIN_HEADER = "X-oMLX-Cache-Pin"
 
 
 def _cache_store_kwargs(http_request: FastAPIRequest | None) -> dict[str, bool]:
     if http_request is None:
         return {}
+    kwargs: dict[str, bool] = {}
     value = http_request.headers.get(_CACHE_STORE_HEADER, "").strip().lower()
-    return {"skip_cache_store": True} if value == "off" else {}
+    if value == "off":
+        kwargs["skip_cache_store"] = True
+    if http_request.headers.get(_CACHE_PIN_HEADER, "").strip().lower() == "on":
+        kwargs["pin_cache"] = True
+    return kwargs
 
 
 def get_model_settings_for_request(model_id: str | None):
@@ -4676,7 +4683,9 @@ async def create_completion(
                                 resolved_model=resolved_model,
                                 response_id=response_id,
                                 inference_request_id=inference_request_id,
-                                skip_cache_store=bool(_cache_store_kwargs(http_request)),
+                                skip_cache_store=bool(
+                                    _cache_store_kwargs(http_request).get("skip_cache_store")
+                                ),
                             ),
                             http_request=http_request,
                             keepalive_chunk=keepalive,

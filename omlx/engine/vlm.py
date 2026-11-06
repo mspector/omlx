@@ -4930,6 +4930,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            pin_cache=bool(kwargs.get("pin_cache", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
@@ -5053,6 +5054,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            pin_cache=bool(kwargs.get("pin_cache", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(

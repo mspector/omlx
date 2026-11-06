@@ -1323,19 +1323,27 @@ class PagedSSDCacheIndex:
                 self._lru.move_to_end(block_hash)
                 self._lru[block_hash] = self._index[block_hash].last_access
 
-    def get_lru_entries(self, count: int) -> list[PagedSSDBlockMetadata]:
+    def get_lru_entries(
+        self, count: int, exclude: set[bytes] | None = None
+    ) -> list[PagedSSDBlockMetadata]:
         """
         Get least recently used entries.
 
         Args:
             count: Maximum number of entries to return.
+            exclude: Block hashes that are never returned, so pinned
+                blocks survive the size cap.
 
         Returns:
             List of LRU metadata entries.
         """
         with self._lock:
             result = []
-            for block_hash in list(self._lru.keys())[:count]:
+            for block_hash in self._lru.keys():
+                if len(result) >= count:
+                    break
+                if exclude and block_hash in exclude:
+                    continue
                 if block_hash in self._index:
                     result.append(self._index[block_hash])
             return result
@@ -1528,13 +1536,20 @@ class GDNCheckpointIndex:
             self._lru.move_to_end(key)
             self._lru[key] = metadata.last_access
 
-    def get_lru_entries(self, count: int) -> list[GDNCheckpointMetadata]:
+    def get_lru_entries(
+        self, count: int, exclude: set[bytes] | None = None
+    ) -> list[GDNCheckpointMetadata]:
         with self._lock:
             result = []
-            for key in list(self._lru)[:count]:
+            for key in self._lru:
+                if len(result) >= count:
+                    break
                 metadata = self._index.get(key)
-                if metadata is not None:
-                    result.append(metadata)
+                if metadata is None:
+                    continue
+                if exclude and metadata.source_block_hash in exclude:
+                    continue
+                result.append(metadata)
             return result
 
     def sort_lru_by_last_access(self) -> None:
@@ -1845,6 +1860,11 @@ class PagedSSDCacheManager(CacheManager):
         # promoted into the raw-byte hot cache.  They still consume the same
         # shared SSD budget as the two main block indexes.
         self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
+        # Block hashes a client pinned: never chosen by the SSD size cap's
+        # LRU walk, so a record's prefix survives a burst of other
+        # requests. Pins live only for the process; the index is rescanned
+        # at startup and the client pins again.
+        self._pinned: set[bytes] = set()
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
@@ -5036,6 +5056,23 @@ class PagedSSDCacheManager(CacheManager):
             disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
             return min(self._max_size, disk_limit)
 
+    def pin_blocks(self, block_hashes: list[bytes] | set[bytes]) -> int:
+        """Exempt blocks from the size cap's eviction; returns how many are pinned."""
+        with self._lock:
+            self._pinned.update(bytes(h) for h in block_hashes)
+            return len(self._pinned)
+
+    def unpin_all(self) -> int:
+        """Drop every pin; returns how many were dropped."""
+        with self._lock:
+            n = len(self._pinned)
+            self._pinned.clear()
+            return n
+
+    def pinned_block_hashes(self) -> set[bytes]:
+        with self._lock:
+            return set(self._pinned)
+
     def _evict_tracked_until_size(
         self,
         target_size: int,
@@ -5055,9 +5092,13 @@ class PagedSSDCacheManager(CacheManager):
             if max_count is not None and len(evicted) >= max_count:
                 break
 
-            compatible = self._index.get_lru_entries(1)
-            incompatible = self._incompatible_index.get_lru_entries(1)
-            sidecars = self._gdn_sidecar_index.get_lru_entries(1)
+            compatible = self._index.get_lru_entries(1, exclude=self._pinned)
+            incompatible = self._incompatible_index.get_lru_entries(
+                1, exclude=self._pinned
+            )
+            sidecars = self._gdn_sidecar_index.get_lru_entries(
+                1, exclude=self._pinned
+            )
             candidates: list[tuple[float, int, Any, Any]] = []
             if compatible:
                 candidates.append((compatible[0].last_access, 0, self._index, compatible[0]))

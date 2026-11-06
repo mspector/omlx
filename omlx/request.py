@@ -178,6 +178,9 @@ class Request:
     # pollute the shared cache tiers or trigger the completion-time
     # host memcpy + disk write.
     skip_cache_store: bool = False
+    # Pin this request's blocks against the SSD size cap after they are
+    # stored, so a record's prefix survives other requests' churn.
+    pin_cache: bool = False
     # Emit per-chunk timing diagnostics for an internal throughput benchmark.
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False
