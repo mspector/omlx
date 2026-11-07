@@ -7799,57 +7799,25 @@ async def probe_cache(
             detail="Cache block size unavailable — cache may not be enabled.",
         )
 
-    # Render + tokenize the prompt using the same path as generation so the
-    # hashes line up with what the scheduler would produce at prefill.
+    # Tokenize through the chat route's own preparation and the engine's
+    # own rendering, the path /v1/tokenize uses, so the ids are the ones
+    # generation sees and the block hashes line up with what the
+    # scheduler stored; the probe's own rendering differed from it by a
+    # few tokens and found nothing.
     try:
-        messages = _normalize_probe_tool_calls(request.messages)
-        # The chat route reshapes messages before the template: it inlines
-        # or strips a turn's reasoning_content as the template expects and
-        # extracts text content. A probe of the raw messages renders a
-        # different prompt and hashes blocks that were never stored.
-        try:
-            from ..api.openai_models import ChatCompletionRequest
-            from ..server import _extract_chat_messages
+        from ..api.openai_models import TokenizeChatRequest
+        from ..server import _tokenize_chat_messages
 
-            shaped = _extract_chat_messages(
-                ChatCompletionRequest(
-                    model=request.model_id, messages=messages, tools=request.tools
-                ),
-                engine,
-                request.model_id,
-                None,
-            )
-            messages = shaped.messages
-        except Exception as exc:
-            logger.debug("Probe falls back to raw messages: %s", exc)
-        if hasattr(engine, "_preprocess_messages"):
-            messages = engine._preprocess_messages(messages)
-        try:
-            from ..api.tool_calling import convert_tools_for_template  # type: ignore
-
-            template_tools = (
-                convert_tools_for_template(request.tools) if request.tools else None
-            )
-        except Exception:
-            template_tools = request.tools or None
-        if hasattr(engine, "_apply_chat_template"):
-            prompt = engine._apply_chat_template(
-                messages,
-                template_tools,
-                chat_template_kwargs=_probe_chat_template_kwargs(
-                    request,
-                    preserve_thinking_default=getattr(
-                        entry, "preserve_thinking_default", None
-                    ),
-                ),
-            )
-        else:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        token_ids = list(tokenizer.encode(prompt))
+        token_ids = await _tokenize_chat_messages(
+            TokenizeChatRequest(
+                model=request.model_id,
+                messages=_normalize_probe_tool_calls(request.messages),
+                tools=request.tools,
+                chat_template_kwargs=request.chat_template_kwargs,
+            ),
+            engine,
+            request.model_id,
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=400, detail=f"Failed to tokenize messages: {exc}"
