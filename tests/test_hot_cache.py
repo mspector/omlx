@@ -1732,3 +1732,131 @@ class TestHotCacheWriteThrough:
         settings.cache.hot_cache_write_through = True
         config = settings.to_scheduler_config()
         assert config.hot_cache_write_through is True
+
+
+class _Owner:
+    """A hot-cache budget owner with its own pins."""
+
+    def __init__(self):
+        self.pins: set[bytes] = set()
+
+    def _is_pinned(self, block_hash: bytes) -> bool:
+        return block_hash in self.pins
+
+
+class TestSharedHotCacheBudgetPins:
+    """The shared budget never picks a pinned entry as a victim."""
+
+    def test_pinned_entry_survives_churn(self):
+        budget = SharedHotCacheBudget(250)
+        owner = _Owner()
+        assert budget.put(owner, b"h1", 100) == []
+        owner.pins.add(b"h1")
+        assert budget.put(owner, b"h2", 100) == []
+        assert budget.put(owner, b"h3", 100) == [(owner, b"h2")]
+        assert budget.put(owner, b"h4", 100) == [(owner, b"h3")]
+        assert budget.total_bytes == 200
+
+    def test_pinned_bytes_leaving_no_room_skip_admission(self):
+        budget = SharedHotCacheBudget(250)
+        owner = _Owner()
+        budget.put(owner, b"h1", 100)
+        budget.put(owner, b"h2", 100)
+        owner.pins.update({b"h1", b"h2"})
+
+        assert budget.put(owner, b"h3", 100) is None
+        assert budget.total_bytes == 200
+
+        owner.pins.clear()
+        assert budget.put(owner, b"h3", 100) == [(owner, b"h1")]
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestHotCachePins:
+    """Pinned blocks are exempt from the hot tier's eviction."""
+
+    def _entry_size(self):
+        return 2 * 2 * 1 * 2 * 16 * 16 * 4
+
+    def _manager(self, tmp_path, **kwargs):
+        return PagedSSDCacheManager(
+            cache_dir=tmp_path / "pins",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=self._entry_size() * 2 + 100,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _save(mgr, block_hash):
+        assert mgr.save_block(
+            block_hash=block_hash,
+            cache_data=[
+                (mx.zeros((1, 2, 16, 16)), mx.zeros((1, 2, 16, 16)))
+                for _ in range(2)
+            ],
+            token_count=16,
+            model_name="test",
+            layer_cache_types=["KVCache"] * 2,
+        )
+
+    def test_pinned_block_survives_churn(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        try:
+            self._save(mgr, b"pinned")
+            mgr.pin_blocks([b"pinned"])
+            for i in range(3):
+                self._save(mgr, f"churn_{i}".encode())
+
+            assert b"pinned" in mgr._hot_cache
+            assert b"churn_2" in mgr._hot_cache
+            assert b"churn_0" not in mgr._hot_cache
+            assert b"churn_1" not in mgr._hot_cache
+        finally:
+            mgr.close()
+
+    @pytest.mark.parametrize("shared_budget", [False, True])
+    def test_pinned_bytes_over_budget_skip_admission(
+        self, tmp_path, caplog, shared_budget
+    ):
+        budget = (
+            SharedHotCacheBudget(self._entry_size() * 2 + 100)
+            if shared_budget
+            else None
+        )
+        mgr = self._manager(tmp_path, hot_cache_budget=budget)
+        try:
+            self._save(mgr, b"pinned_0")
+            self._save(mgr, b"pinned_1")
+            mgr.pin_blocks([b"pinned_0", b"pinned_1"])
+            with caplog.at_level("INFO", logger="omlx.cache.paged_ssd_cache"):
+                self._save(mgr, b"skipped")
+
+            assert b"pinned_0" in mgr._hot_cache
+            assert b"pinned_1" in mgr._hot_cache
+            assert b"skipped" not in mgr._hot_cache
+            if budget is not None:
+                assert budget.total_bytes == mgr._hot_cache_total_bytes
+            assert "goes to SSD only" in caplog.text
+            # Kept on the SSD tier only.
+            assert mgr.has_block(b"skipped")
+            assert mgr.load_block(b"skipped") is not None
+        finally:
+            mgr.close()
+
+    def test_unpin_all_restores_eviction(self, tmp_path):
+        mgr = self._manager(tmp_path)
+        try:
+            self._save(mgr, b"pinned")
+            mgr.pin_blocks([b"pinned"])
+            self._save(mgr, b"churn_0")
+            self._save(mgr, b"churn_1")
+            assert b"pinned" in mgr._hot_cache
+
+            assert mgr.unpin_all() == 1
+            # Unpinning keeps the entries; it only makes them evictable.
+            assert b"pinned" in mgr._hot_cache
+            self._save(mgr, b"churn_2")
+            assert b"pinned" not in mgr._hot_cache
+            assert mgr.load_block(b"pinned") is not None
+        finally:
+            mgr.close()

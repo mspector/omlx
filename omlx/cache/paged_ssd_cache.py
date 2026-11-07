@@ -1742,10 +1742,21 @@ class SharedHotCacheBudget:
                 owner._handle_hot_cache_eviction(block_hash, evicted)
         return freed
 
+    @staticmethod
+    def _is_pinned(entry: _HotCacheBudgetEntry) -> bool:
+        is_pinned = getattr(entry.owner, "_is_pinned", None)
+        return callable(is_pinned) and bool(is_pinned(entry.block_hash))
+
     def put(
         self, owner: Any, block_hash: bytes, size_bytes: int
-    ) -> list[tuple[Any, bytes]]:
-        """Account an entry and return globally-evicted owners/block hashes."""
+    ) -> list[tuple[Any, bytes]] | None:
+        """Account an entry and return globally-evicted owners/block hashes.
+
+        Pinned entries are never chosen as victims. When the other pinned
+        entries leave no room for this one, nothing is evicted, the entry is
+        not accounted, and None is returned: the caller keeps it out of the
+        hot tier.
+        """
         victims: list[tuple[Any, bytes]] = []
         size_bytes = max(0, int(size_bytes))
         with self._lock:
@@ -1754,6 +1765,14 @@ class SharedHotCacheBudget:
             if old is not None:
                 self._total_bytes = max(0, self._total_bytes - old.size_bytes)
 
+            pinned_bytes = sum(
+                entry.size_bytes
+                for entry in self._entries.values()
+                if self._is_pinned(entry)
+            )
+            if pinned_bytes and pinned_bytes + size_bytes > self.max_bytes:
+                return None
+
             self._entries[key] = _HotCacheBudgetEntry(
                 owner=owner,
                 block_hash=block_hash,
@@ -1761,11 +1780,18 @@ class SharedHotCacheBudget:
             )
             self._total_bytes += size_bytes
 
-            while self._total_bytes > self.max_bytes and self._entries:
-                victim_key, victim = self._entries.popitem(last=False)
-                if victim_key == key and not self._entries:
-                    self._entries[victim_key] = victim
+            while self._total_bytes > self.max_bytes:
+                victim_key = next(
+                    (
+                        k
+                        for k, entry in self._entries.items()
+                        if k != key and not self._is_pinned(entry)
+                    ),
+                    None,
+                )
+                if victim_key is None:
                     break
+                victim = self._entries.pop(victim_key)
                 self._total_bytes = max(0, self._total_bytes - victim.size_bytes)
                 victims.append((victim.owner, victim.block_hash))
 
@@ -2088,10 +2114,17 @@ class PagedSSDCacheManager(CacheManager):
             return
         self._enqueue_ssd_write(block_hash, entry)
 
+    def _is_pinned(self, block_hash: bytes) -> bool:
+        """Whether a block is pinned. Lock-free (a set membership read), so
+        the hot tier can ask under its own locks."""
+        return block_hash in self._pinned
+
     def _hot_cache_put(self, block_hash: bytes, entry: dict) -> None:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
 
         Evicted entries are flushed to SSD via the background writer thread.
+        Pinned entries are never evicted; when they leave no room for this
+        entry, it is kept out of the hot tier and goes to SSD only.
         """
         entry_size = self._hot_cache_entry_size(entry)
         evicted_entries: list = []
@@ -2105,6 +2138,10 @@ class PagedSSDCacheManager(CacheManager):
                 self._hot_cache_total_bytes += entry_size
 
             victims = self._hot_cache_budget.put(self, block_hash, entry_size)
+            if victims is None:
+                self._hot_cache_remove(block_hash, update_budget=False)
+                self._skip_hot_cache_admission(block_hash, entry)
+                return
             for owner, victim_hash in victims:
                 evicted = owner._hot_cache_remove(victim_hash, update_budget=False)
                 if evicted is not None:
@@ -2117,21 +2154,48 @@ class PagedSSDCacheManager(CacheManager):
                 old = self._hot_cache.pop(block_hash)
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(old)
 
-            # Evict LRU entries until we have room
+            pinned_bytes = sum(
+                self._hot_cache_entry_size(cached)
+                for cached_hash, cached in self._hot_cache.items()
+                if self._is_pinned(cached_hash)
+            )
+            admitted = not (
+                pinned_bytes
+                and pinned_bytes + entry_size > self._hot_cache_max_bytes
+            )
+
+            # Evict unpinned LRU entries until we have room
             while (
-                self._hot_cache_total_bytes + entry_size > self._hot_cache_max_bytes
-                and self._hot_cache
+                admitted
+                and self._hot_cache_total_bytes + entry_size > self._hot_cache_max_bytes
             ):
-                evicted_hash, evicted = self._hot_cache.popitem(last=False)
+                evicted_hash = next(
+                    (h for h in self._hot_cache if not self._is_pinned(h)), None
+                )
+                if evicted_hash is None:
+                    break
+                evicted = self._hot_cache.pop(evicted_hash)
                 self._hot_cache_total_bytes -= self._hot_cache_entry_size(evicted)
                 evicted_entries.append((evicted_hash, evicted))
 
-            self._hot_cache[block_hash] = entry
-            self._hot_cache_total_bytes += entry_size
+            if admitted:
+                self._hot_cache[block_hash] = entry
+                self._hot_cache_total_bytes += entry_size
 
         # Flush evicted entries to SSD outside the hot cache lock
         for evicted_hash, evicted in evicted_entries:
             self._handle_hot_cache_eviction(evicted_hash, evicted)
+        if not admitted:
+            self._skip_hot_cache_admission(block_hash, entry)
+
+    def _skip_hot_cache_admission(self, block_hash: bytes, entry: dict) -> None:
+        """Keep an entry the pinned bytes leave no room for on the SSD tier only."""
+        logger.info(
+            "Pinned blocks fill the hot cache; block %s goes to SSD only",
+            block_hash.hex()[:16],
+        )
+        if not entry.get("staging") and entry.get("dirty", True):
+            self._enqueue_ssd_write(block_hash, entry)
 
     def _enqueue_ssd_write(
         self,
@@ -5113,7 +5177,7 @@ class PagedSSDCacheManager(CacheManager):
             return min(self._max_size, disk_limit)
 
     def pin_blocks(self, block_hashes: list[bytes] | set[bytes]) -> int:
-        """Exempt blocks from the size cap's eviction; returns how many are pinned."""
+        """Exempt blocks from SSD-cap and hot-tier eviction; returns the pin count."""
         with self._lock:
             self._pinned.update(bytes(h) for h in block_hashes)
             return len(self._pinned)
