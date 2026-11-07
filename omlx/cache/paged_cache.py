@@ -1292,8 +1292,12 @@ class PagedCacheManager(CacheManager):
         parent_hash: Optional[BlockHash],
         start: int,
         tokenizer: Any,
+        longer_than: int = 0,
     ) -> Optional[Tuple[BlockHash, int, List[int]]]:
         """Find the longest tail under ``parent_hash`` whose text the prompt continues.
+
+        Only tails of more than ``longer_than`` tokens are considered, so a
+        caller holding a hash match asks only for a longer one.
 
         Compares bytes, not ids: the prompt past ``start`` may spell a stored
         tail's text with other ids (a client re-tokenizing sampled text, or
@@ -1312,7 +1316,7 @@ class PagedCacheManager(CacheManager):
             candidates = [
                 (tail_hash, length, self._tail_texts[tail_hash])
                 for tail_hash, length in (tails or {}).items()
-                if tail_hash in self._tail_texts
+                if tail_hash in self._tail_texts and length > longer_than
             ]
         if not candidates or start >= len(token_ids):
             return None
@@ -1341,9 +1345,11 @@ class PagedCacheManager(CacheManager):
     ) -> Optional[List[int]]:
         """The prompt's ids with a stored tail spliced in where only its bytes match.
 
-        Walks the full blocks as get_computed_blocks does, read-only, and
-        returns None when a tail already matches by hash or none matches by
-        text.
+        Walks the full blocks as get_computed_blocks does, read-only. The
+        longest tail matching by hash or by text wins: a tail matching only
+        by text is spliced in if it is longer than every held tail matching
+        by hash (a turn end stored after an older, shorter one under the same
+        parent). Returns None when the hash match stands or nothing matches.
         """
         with self._lock:
             if not self._tail_texts:
@@ -1363,15 +1369,26 @@ class PagedCacheManager(CacheManager):
             tails = self._tail_index.get(parent_hash)
             if not tails or start >= len(token_ids):
                 return None
-            for tail_hash, length in tails.items():
+            hash_length = self._longest_hash_tail(token_ids, parent_hash, start)[1]
+        match = self.match_tail_text(
+            token_ids, parent_hash, start, tokenizer, longer_than=hash_length
+        )
+        return match[2] if match is not None else None
+
+    def _longest_hash_tail(
+        self, token_ids: List[int], parent_hash: Optional[BlockHash], start: int
+    ) -> Tuple[Optional[BlockHash], int]:
+        """The longest held tail under ``parent_hash`` matching by hash. Read-only."""
+        with self._lock:
+            tails = self._tail_index.get(parent_hash) or {}
+            for tail_hash, length in sorted(tails.items(), key=lambda kv: -kv[1]):
                 if length <= len(token_ids) - start and compute_block_hash(
                     parent_hash,
                     token_ids[start : start + length],
                     model_name=self.model_name,
                 ) == tail_hash and self._block_held(tail_hash):
-                    return None
-        match = self.match_tail_text(token_ids, parent_hash, start, tokenizer)
-        return match[2] if match is not None else None
+                    return tail_hash, length
+        return None, 0
 
     def _match_tail_block(
         self,

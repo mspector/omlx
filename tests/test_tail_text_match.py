@@ -210,6 +210,68 @@ class TestTrailingWhitespace:
         assert paged.splice_tail_by_text(TOK.encode("efghabcd"), TOK) is None
 
 
+class TestLongestTailWins:
+    """Under one parent the longest tail wins, matched by hash or by text."""
+
+    def _parent(self):
+        paged = PagedCacheManager(
+            block_size=8, max_blocks=16, initial_blocks=16, model_name="m"
+        )
+        full = TOK.encode("efghijkl")
+        return paged, full, _hold(paged, None, full)
+
+    def _tail(self, paged, parent, ids):
+        tail_hash = _hold(paged, parent, ids)
+        paged.register_tail_block(
+            parent, tail_hash, len(ids), text=TOK.decode(ids), token_ids=ids
+        )
+        return tail_hash
+
+    @staticmethod
+    def _probe_paged(paged, token_ids):
+        scheduler = SimpleNamespace(
+            block_aware_cache=SimpleNamespace(block_size=8),
+            paged_ssd_cache_manager=None,
+            paged_cache_manager=paged,
+            config=SimpleNamespace(paged_cache_block_size=8),
+        )
+        return _probe(scheduler, token_ids)
+
+    def test_longer_tail_by_text_beats_shorter_tail_by_hash(self):
+        paged, full, parent = self._parent()
+        self._tail(paged, parent, _ids("ab"))
+        long_ids = _ids("abcd") + [EOS]
+        long_hash = self._tail(paged, parent, long_ids)
+        # The older turn end matches by hash; the newer one only by text,
+        # its "cd" re-tokenized as one id.
+        prompt = full + _ids("ab") + [_VOCAB.index("cd"), EOS] + _ids("x")
+        assert paged.get_computed_blocks(prompt)[1] == 10
+
+        spliced = paged.splice_tail_by_text(prompt, TOK)
+
+        assert spliced == full + long_ids + _ids("x")
+        blocks, cached = paged.get_computed_blocks(spliced)
+        assert cached == 13 and blocks[-1].block_hash == long_hash
+        probe = self._probe_paged(paged, prompt)
+        assert probe["live_tail_tokens"] == 5
+        assert probe["live_hit_tokens"] == 13
+        assert probe["live_prompt_tokens"] == 14
+
+    def test_longer_tail_by_hash_beats_shorter_tail_by_text(self):
+        paged, full, parent = self._parent()
+        self._tail(paged, parent, [_VOCAB.index("ab")])
+        long_ids = _ids("abcd") + [EOS]
+        self._tail(paged, parent, long_ids)
+        prompt = full + long_ids + _ids("x")
+
+        assert paged.splice_tail_by_text(prompt, TOK) is None
+        assert paged.get_computed_blocks(prompt)[1] == 13
+        probe = self._probe_paged(paged, prompt)
+        assert probe["live_tail_tokens"] == 5
+        assert probe["live_hit_tokens"] == 13
+        assert probe["live_prompt_tokens"] == 14
+
+
 @pytest.mark.parametrize("raw_on_disk", [False, True])
 def test_tail_text_persists_across_a_rescan(tmp_path, raw_on_disk):
     """The text and ids are saved with the tail's metadata and seed the index.
