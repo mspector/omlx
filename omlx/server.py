@@ -2121,6 +2121,7 @@ def _ignore_eos_kwargs(request) -> dict[str, bool]:
 _CACHE_STORE_HEADER = "X-oMLX-Cache-Store"
 # `on` pins the request's blocks against the SSD size cap once stored.
 _CACHE_PIN_HEADER = "X-oMLX-Cache-Pin"
+_CACHE_PIN_HEADER_ALIAS = "X-Cache-Pin"
 
 
 def _cache_store_kwargs(http_request: FastAPIRequest | None) -> dict[str, bool]:
@@ -2130,7 +2131,10 @@ def _cache_store_kwargs(http_request: FastAPIRequest | None) -> dict[str, bool]:
     value = http_request.headers.get(_CACHE_STORE_HEADER, "").strip().lower()
     if value == "off":
         kwargs["skip_cache_store"] = True
-    if http_request.headers.get(_CACHE_PIN_HEADER, "").strip().lower() == "on":
+    if any(
+        http_request.headers.get(name, "").strip().lower() == "on"
+        for name in (_CACHE_PIN_HEADER, _CACHE_PIN_HEADER_ALIAS)
+    ):
         kwargs["pin_cache"] = True
     return kwargs
 
