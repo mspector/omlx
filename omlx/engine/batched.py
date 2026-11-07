@@ -1447,7 +1447,9 @@ class BatchedEngine(BaseEngine):
             kwargs,
             full_prompt_token_count=len(prepared[1]) if prepared is not None else None,
         )
-        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        generation_prompt, persists = self._generation_prompt_text(
+            ct_kwargs, partial, template_tools
+        )
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
@@ -1614,7 +1616,9 @@ class BatchedEngine(BaseEngine):
             kwargs,
             full_prompt_token_count=len(prepared[1]) if prepared is not None else None,
         )
-        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        generation_prompt, persists = self._generation_prompt_text(
+            ct_kwargs, partial, template_tools
+        )
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists

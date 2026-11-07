@@ -265,16 +265,24 @@ class BaseEngine(ABC):
         self,
         chat_template_kwargs: Optional[Dict[str, Any]],
         is_partial: Optional[bool],
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[Optional[str], bool]:
         """Return ``(suffix, persists)`` for the template's generation prompt.
 
         ``persists`` is True when an assistant turn followed by a user turn still
-        renders that suffix, so cache state past it stays reusable. Memoized.
+        renders that suffix, so cache state past it stays reusable. The probe
+        renders the request's ``tools``, as the request is rendered: some
+        templates keep earlier turns whole only when tools are declared.
+        Memoized per template kwargs and whether tools are present.
         """
         render = getattr(self, "_apply_chat_template", None)
         if is_partial or not callable(render):
             return None, False
-        key = repr(sorted((chat_template_kwargs or {}).items(), key=repr))
+        tools = tools or None
+        key = (
+            repr(sorted((chat_template_kwargs or {}).items(), key=repr)),
+            tools is not None,
+        )
         cache = self.__dict__.setdefault("_generation_prompt_cache", {})
         if key in cache:
             return cache[key]
@@ -284,13 +292,13 @@ class BaseEngine(ABC):
             probe = [{"role": "user", "content": "probe"}]
             with_prompt = render(
                 [dict(m) for m in probe],
-                None,
+                tools,
                 chat_template_kwargs=chat_template_kwargs,
                 is_partial=False,
             )
             without = render(
                 [dict(m) for m in probe],
-                None,
+                tools,
                 chat_template_kwargs=chat_template_kwargs,
                 is_partial=False,
                 add_generation_prompt=False,
@@ -310,7 +318,7 @@ class BaseEngine(ABC):
                         {"role": "assistant", "content": "reply"},
                         {"role": "user", "content": "next"},
                     ],
-                    None,
+                    tools,
                     chat_template_kwargs=chat_template_kwargs,
                     is_partial=False,
                     add_generation_prompt=False,
@@ -318,6 +326,12 @@ class BaseEngine(ABC):
                 persists = isinstance(history, str) and history.startswith(with_prompt)
         except Exception as e:
             logger.debug(f"Generation prompt suffix calc failed: {e}")
+        if tools is not None and suffix is None:
+            # The rendering with tools found no generation prompt: keep the
+            # marker the rendering without them finds.
+            suffix, persists = self._generation_prompt_text(
+                chat_template_kwargs, is_partial
+            )
         if len(cache) >= 16:
             cache.clear()
         cache[key] = (suffix, persists)

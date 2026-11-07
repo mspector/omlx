@@ -5174,7 +5174,9 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
-        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        generation_prompt, persists = self._generation_prompt_text(
+            ct_kwargs, partial, convert_tools_for_template(tools) if tools else None
+        )
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
@@ -5432,7 +5434,9 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: protect the system-prompt region from token dropping.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
-        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        generation_prompt, persists = self._generation_prompt_text(
+            ct_kwargs, partial, convert_tools_for_template(tools) if tools else None
+        )
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists

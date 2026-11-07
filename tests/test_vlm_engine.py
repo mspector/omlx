@@ -343,6 +343,48 @@ class TestVLMToolForwarding:
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
+    async def test_generation_prompt_persistence_is_probed_with_the_tools(self):
+        """A template that keeps history whole only with tools persists for
+        a request with tools and not for one without."""
+        executor = ThreadPoolExecutor(max_workers=1)
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            generate=AsyncMock(return_value=self._output()),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        def fake_template(msgs, tools=None, **kwargs):
+            if any(m["role"] == "assistant" for m in msgs):
+                turn = "<A><think>reply" if tools else "<A></think>reply"
+                return "PROMPT" + turn + "<U>next"
+            if kwargs.get("add_generation_prompt") is False:
+                return "PROMPT"
+            return "PROMPT<A><think>"
+
+        engine._apply_chat_template = fake_template
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                await engine.chat(
+                    [{"role": "user", "content": "hi"}], tools=self.tools
+                )
+                kwargs = core.generate.call_args.kwargs
+                assert kwargs["generation_prompt_text"] == "<A><think>"
+                assert kwargs["generation_prompt_persists"] is True
+                await engine.chat([{"role": "user", "content": "hi"}])
+                kwargs = core.generate.call_args.kwargs
+                assert kwargs["generation_prompt_persists"] is False
+        finally:
+            executor.shutdown(wait=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
     async def test_stream_chat_forwards_tools_to_core_request(self):
         executor = ThreadPoolExecutor(max_workers=1)
 

@@ -376,7 +376,7 @@ def _rig(tmp_path, kind="gdn", block_size=4):
     return model, scheduler, paged, ssd, prefix
 
 
-def _finish_turn(scheduler, prompt, sampled):
+def _finish_turn(scheduler, prompt, sampled, **request_fields):
     """Generate ``sampled`` then the stop token, and store the finished request."""
     script = iter(sampled + [EOS])
 
@@ -395,6 +395,7 @@ def _finish_turn(scheduler, prompt, sampled):
         request_id="turn",
         prompt=list(prompt),
         sampling_params=SamplingParams(max_tokens=16),
+        **request_fields,
     )
     scheduler.add_request(request)
     scheduler.waiting.clear()
@@ -542,6 +543,34 @@ def test_sampled_trailing_space_matches_the_stripped_resend(tmp_path):
     finally:
         scheduler.shutdown()
 
+
+@pytest.mark.parametrize("persists", [True, False])
+def test_turn_end_tail_follows_the_requests_persistence(tmp_path, persists):
+    """With a generation prompt, the turn-end tail is stored only when the
+    engine found that history keeps it for this request's shape (with tools,
+    say), and otherwise the store stops at the generation prompt."""
+    model, scheduler, paged, ssd, prefix = _rig(tmp_path)
+    try:
+        prompt = TOK.encode("efgha")
+        request = _finish_turn(
+            scheduler,
+            prompt,
+            [_VOCAB.index("b")],
+            generation_prompt_text="a",
+            generation_prompt_persists=persists,
+        )
+        assert request.generation_prompt_start == 4
+        turn = prompt + [_VOCAB.index("b"), EOS]
+        parent = compute_block_hash(None, turn[:4], model_name="tiny-qwen")
+        tail_hash = compute_block_hash(parent, turn[4:], model_name="tiny-qwen")
+        if persists:
+            assert request.turn_end_tokens == 7
+            assert paged._tail_texts[tail_hash][0] == "ab<eos>"
+        else:
+            assert request.turn_end_tokens == 0
+            assert not paged._tail_texts
+    finally:
+        scheduler.shutdown()
 
 def test_turn_end_excludes_a_stop_token_the_template_does_not_render(tmp_path):
     """A hybrid cache cannot cut back past the stop token, so no tail is kept."""

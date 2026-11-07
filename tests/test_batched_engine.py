@@ -1131,6 +1131,60 @@ class TestBatchedEngineSpecPrefillForwarding:
         assert "generation_prompt_text" not in call_kwargs
 
     @pytest.mark.asyncio
+    async def test_generation_prompt_persists_for_the_request_with_tools(self):
+        """Persistence is probed with the request's tools and memoized per
+        template kwargs and whether tools are present."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model_settings = SimpleNamespace(specprefill_enabled=False)
+        engine._preprocess_messages = lambda m: m
+        engine._tokenizer = MagicMock()
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+        renders = []
+
+        def fake_template(msgs, tools=None, **kwargs):
+            # A DeepSeek-style encoder: history keeps the reply behind the
+            # generation prompt only when tools are declared.
+            if msgs[0]["content"] == "probe":
+                renders.append(tools is not None)
+            head = "TOOLS" if tools else ""
+            if any(m["role"] == "assistant" for m in msgs):
+                turn = "<A><think>reply" if tools else "<A></think>reply"
+                return head + "PROMPT" + turn + "<U>next"
+            if kwargs.get("add_generation_prompt") is False:
+                return head + "PROMPT"
+            return head + "PROMPT<A><think>"
+
+        engine._apply_chat_template = fake_template
+        messages = [{"role": "user", "content": "hi"}]
+        tools = [{"type": "function", "function": {"name": "weather"}}]
+
+        await engine.chat(messages, tools=tools)
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["generation_prompt_text"] == "<A><think>"
+        assert call_kwargs["generation_prompt_persists"] is True
+
+        await engine.chat(messages)
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["generation_prompt_text"] == "<A><think>"
+        assert call_kwargs["generation_prompt_persists"] is False
+
+        # Both shapes are memoized: three probe renders each, once.
+        assert renders == [True] * 3 + [False] * 3
+        await engine.chat(messages, tools=tools)
+        assert engine._engine.generate.call_args.kwargs["generation_prompt_persists"]
+        await engine.chat(messages)
+        assert len(renders) == 6
+        assert set(engine._generation_prompt_cache) == {
+            ("[]", True),
+            ("[]", False),
+        }
+
+    @pytest.mark.asyncio
     async def test_chat_forwards_system_prefix_ids_once_seen(self):
         """A repeated system block reaches the engine as its rendered token ids."""
         from omlx.engine.batched import BatchedEngine
