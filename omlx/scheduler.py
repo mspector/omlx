@@ -55,7 +55,7 @@ from mlx_vlm.models import cache as _vlm_cache
 from .cache.deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_snapshot
 from .cache.deepseek_v41_delta import is_delta as is_deepseek_v41_delta
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
-from .cache.paged_cache import PagedCacheManager
+from .cache.paged_cache import PagedCacheManager, decode_tail_ids
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .decode_activity import get_decode_activity
@@ -2896,6 +2896,7 @@ class Scheduler:
         hot_cache_write_back: bool = True,
         system_store: tuple[list[int], list[Any], Any, Any] | None = None,
         pin_cache: bool = False,
+        tail_text: str | None = None,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
@@ -2955,6 +2956,11 @@ class Scheduler:
                     extra_key_ranges=extra_key_ranges,
                     hot_cache_write_back=hot_cache_write_back,
                     _store_tail_terminal=store_tail_terminal,
+                    **(
+                        {"_tail_text": tail_text}
+                        if store_tail_terminal and tail_text is not None
+                        else {}
+                    ),
                 )
                 if system_store is not None:
                     # Before the release below, so the shared blocks stay pinned.
@@ -10020,7 +10026,8 @@ class Scheduler:
     ) -> None:
         """Preserve a verified terminal boundary after the generator drops its UID.
 
-        Only an aligned end qualifies; a prefill tail below it does not block it.
+        An aligned end qualifies, and the assistant turn's end as a tail; a
+        prefill tail below it does not block it.
         """
         if getattr(request, "skip_cache_store", False):
             return
@@ -10030,10 +10037,16 @@ class Scheduler:
             else len(request.prompt_token_ids)
         )
         block_size = self.config.paged_cache_block_size
+        turn_end = self._turn_end_token_count(request, cache)
+        if turn_end:
+            # Stored to the turn's end, the tail serves every later prompt
+            # that resends the turn, whatever follows it.
+            request.turn_end_tokens = token_count = turn_end
+        tail = block_size > 0 and token_count % block_size != 0
         if (
             block_size <= 0
             or token_count <= 0
-            or token_count % block_size
+            or (tail and not turn_end)
             or not self._detect_boundary_snapshot_need()
         ):
             return
@@ -10051,6 +10064,17 @@ class Scheduler:
         ]
         if not offsets or any(offset != token_count for offset in offsets):
             return
+        if tail:
+            self._on_prefill_boundary_snapshot(
+                request.request_id,
+                [
+                    c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
+                    for c in cache
+                ],
+                token_count,
+                source=_TAIL_SNAPSHOT_SOURCE,
+            )
+            return
         self._on_prefill_boundary_snapshot(
             request.request_id,
             cache,
@@ -10058,6 +10082,124 @@ class Scheduler:
             source="completion",
             snapshot_block_size=self._boundary_snapshot_block_size(request, token_count),
         )
+
+    def _turn_end_token_count(self, request: Request, cache: list[Any]) -> int:
+        """Tokens through the assistant turn's end that the finished cache holds, or 0.
+
+        The output counts when it is cacheable and the history keeps the
+        generation prompt. The stop token is forwarded but not kept as output:
+        the turn ends after it when the template renders it after an
+        assistant message, else before it, which only a cache whose layers
+        all slice can cut back to.
+        """
+        if not _output_tokens_cacheable(request) or not request.output_token_ids:
+            return 0
+        if (getattr(request, "generation_prompt_start", 0) or 0) > 0 and not getattr(
+            request, "generation_prompt_persists", False
+        ):
+            return 0
+        folded = _request_count(request, "requeued_output_tokens")
+        n = len(request.prompt_token_ids) + len(request.output_token_ids) - folded
+        offsets = {
+            offset
+            for layer in cache
+            if (offset := _first_leaf_cache_offset(layer)) is not None
+        }
+        if len(offsets) != 1:
+            return 0
+        offset = offsets.pop()
+        stop = getattr(request, "stop_token_id", None)
+        if offset == n + 1 and isinstance(stop, int):
+            if self._template_renders_after_turn(stop):
+                return n + 1
+            return 0 if self._detect_boundary_snapshot_need() else n
+        return n if offset == n else 0
+
+    def _template_renders_after_turn(self, token_id: int) -> bool:
+        """Whether the template renders ``token_id`` right after an assistant message.
+
+        Memoized.
+        """
+        memo = self.__dict__.setdefault("_turn_end_render_memo", {})
+        if token_id in memo:
+            return memo[token_id]
+        renders = False
+        try:
+            history = self.tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": "probe"},
+                    {"role": "assistant", "content": "reply"},
+                    {"role": "user", "content": "next"},
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            stop_text = decode_tail_ids(self.tokenizer, [token_id])
+            at = history.rfind("reply")
+            renders = bool(stop_text) and at >= 0 and history[
+                at + len("reply") :
+            ].startswith(stop_text)
+        except Exception as e:
+            logger.debug("Turn end rendering check failed: %s", e)
+        memo[token_id] = renders
+        return renders
+
+    def _tail_text_for_store(
+        self, tokens: list[int], snapshots: Any
+    ) -> str | None:
+        """The detokenized tail of a store that ends on a tail, for the byte match."""
+        block_size = self.config.paged_cache_block_size
+        if (
+            block_size <= 0
+            or not len(tokens) % block_size
+            or getattr(snapshots, "tail_terminal_token_count", None) != len(tokens)
+        ):
+            return None
+        try:
+            return decode_tail_ids(
+                self.tokenizer, tokens[len(tokens) - len(tokens) % block_size :]
+            )
+        except Exception as e:
+            logger.debug("Tail text unavailable: %s", e)
+            return None
+
+    def _splice_tail_by_text(self, request: Request) -> None:
+        """Let a prompt reach a stored tail it spells with other ids.
+
+        When no tail under the last matched full block matches by hash but
+        one's text begins the rest of the prompt, the prompt takes the tail's
+        own ids and the tokenization of the text after it, so the hash chain,
+        the prefill and the reported prompt tokens all use the spliced ids.
+        """
+        if (
+            self.paged_cache_manager is None
+            or request.vlm_extra_keys_for_cache is not None
+            or request.vlm_extra_key_ranges_for_cache
+            or request.specprefill_indices is not None
+            or _request_count(request, "requeued_output_tokens")
+        ):
+            return
+        try:
+            spliced = self.paged_cache_manager.splice_tail_by_text(
+                list(request.prompt_token_ids), self.tokenizer
+            )
+        except Exception as e:
+            logger.debug("Tail text match skipped for %s: %s", request.request_id, e)
+            return
+        if not isinstance(spliced, list):
+            return
+        logger.info(
+            "Request %s: matched a stored tail by text (%d -> %d prompt tokens)",
+            request.request_id,
+            len(request.prompt_token_ids),
+            len(spliced),
+        )
+        request.prompt_token_ids = spliced
+        request.num_prompt_tokens = len(spliced)
+        request.generation_prompt_start = 0
+        request.system_prefix_end = 0
+        self._resolve_generation_prompt_start(request)
+        self._resolve_system_prefix_end(request)
 
     def _prepare_prompt_boundary_cache_store(
         self,
@@ -11037,6 +11179,12 @@ class Scheduler:
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
+
+        if (
+            self.block_aware_cache is not None
+            and not self._model_has_unreconstructible_cache()
+        ):
+            self._splice_tail_by_text(request)
 
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
         minimum_prefix = (
@@ -14152,6 +14300,8 @@ class Scheduler:
             is_stop = response.finish_reason == "stop"
             is_length = response.finish_reason == "length"
             is_finished = response.finish_reason is not None
+            if is_stop and isinstance(response.token, int):
+                request.stop_token_id = response.token
 
             # Only append token if not stopping due to EOS token
             new_text = ""
@@ -14618,6 +14768,13 @@ class Scheduler:
                             else:
                                 if _output_tokens_cacheable(request):
                                     cacheable_sequence = full_token_sequence
+                                    if getattr(request, "turn_end_tokens", 0) > len(
+                                        full_token_sequence
+                                    ):
+                                        # The turn ends on the stop token.
+                                        cacheable_sequence = full_token_sequence + [
+                                            request.stop_token_id
+                                        ]
                                 else:
                                     # <think> output is stripped before the next
                                     # turn, so it can never prefix-match.
@@ -14698,6 +14855,26 @@ class Scheduler:
                                                 f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
                                                 f"intermediate snapshots)"
                                             )
+                                        elif (
+                                            getattr(request, "turn_end_tokens", 0)
+                                            == len(token_sequence_to_store)
+                                            and len(token_sequence_to_store)
+                                            % self.config.paged_cache_block_size
+                                        ):
+                                            # Every layer slices, so the live
+                                            # cache holds the tail at the
+                                            # turn's end without a snapshot.
+                                            intermediate_snapshots = (
+                                                _BoundarySnapshotProvider(
+                                                    store=None,
+                                                    request_id=request_id,
+                                                    valid_tcs=[],
+                                                    in_memory_snapshots={},
+                                                    tail_terminal_token_count=len(
+                                                        token_sequence_to_store
+                                                    ),
+                                                )
+                                            )
                                     system_store = self._prepare_system_prefix_store(
                                         request, cache_to_store
                                     )
@@ -14771,6 +14948,9 @@ class Scheduler:
                                     "under memory pressure",
                                     request_id,
                                 )
+                            tail_text = self._tail_text_for_store(
+                                token_sequence_to_store, intermediate_snapshots
+                            )
 
                             if self._store_cache_executor is not None:
                                 # Hand host memcpy and disk write to the
@@ -14801,6 +14981,7 @@ class Scheduler:
                                         hot_cache_write_back,
                                         system_store,
                                         pin_cache=getattr(request, "pin_cache", False),
+                                        tail_text=tail_text,
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -14836,6 +15017,7 @@ class Scheduler:
                                     hot_cache_write_back,
                                     system_store,
                                     pin_cache=getattr(request, "pin_cache", False),
+                                    tail_text=tail_text,
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "

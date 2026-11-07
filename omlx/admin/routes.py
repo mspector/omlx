@@ -7904,6 +7904,7 @@ async def probe_cache(
     live_blocks = 0
     live_tail_tokens = 0
     live_pinned_blocks = 0
+    live_prompt_tokens = total_tokens
     pinned = (
         ssd_manager.pinned_block_hashes()
         if ssd_manager is not None and hasattr(ssd_manager, "pinned_block_hashes")
@@ -7946,6 +7947,19 @@ async def probe_cache(
                     if h in pinned:
                         live_pinned_blocks += 1
                     break
+        # With no tail matched by hash, the scheduler splices in a tail whose
+        # text the prompt continues with before its lookup; so does the probe.
+        match_tail_text = getattr(paged_cache, "match_tail_text", None)
+        if not live_tail_tokens and live_hit_tokens < total_tokens and callable(
+            match_tail_text
+        ):
+            match = match_tail_text(token_ids, parent, live_hit_tokens, tokenizer)
+            if match is not None:
+                tail_hash, live_tail_tokens, spliced = match
+                live_hit_tokens += live_tail_tokens
+                live_prompt_tokens = len(spliced)
+                if tail_hash in pinned:
+                    live_pinned_blocks += 1
 
     return {
         "model_id": request.model_id,
@@ -7961,7 +7975,8 @@ async def probe_cache(
         "live_hit_tokens": live_hit_tokens,
         "live_blocks": live_blocks,
         "live_tail_tokens": live_tail_tokens,
-        "live_cold_tokens": max(total_tokens - live_hit_tokens, 0),
+        "live_cold_tokens": max(live_prompt_tokens - live_hit_tokens, 0),
+        "live_prompt_tokens": live_prompt_tokens,
         "live_pinned_blocks": live_pinned_blocks,
         "pinned_blocks_total": len(pinned),
     }

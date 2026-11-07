@@ -267,6 +267,11 @@ class Request:
     system_prefix_ids: Optional[List[int]] = None
     system_prefix_end: int = 0  # Token index where the shared system prefix ends
 
+    # The sampled stop token: forwarded into the cache, not kept as output.
+    stop_token_id: Optional[int] = None
+    # Tokens through the assistant turn's end that the finished cache holds.
+    turn_end_tokens: int = 0
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter

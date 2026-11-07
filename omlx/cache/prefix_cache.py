@@ -676,7 +676,16 @@ class BlockAwarePrefixCache(CacheManager):
         if not callable(seed_tails):
             return
         try:
-            seeded = self.paged_cache.seed_tail_blocks(seed_tails())
+            seed_texts = getattr(paged_ssd_cache_manager, "iter_tail_texts", None)
+            texts = {
+                tail_hash: (text, token_ids)
+                for tail_hash, text, token_ids in (
+                    seed_texts() if callable(seed_texts) else ()
+                )
+            }
+            seeded = self.paged_cache.seed_tail_blocks(
+                (*entry, *texts.get(entry[1], ())) for entry in seed_tails()
+            )
         except Exception:
             logger.exception("Failed to seed tail blocks from SSD index")
             return
@@ -961,6 +970,7 @@ class BlockAwarePrefixCache(CacheManager):
         _store_exact_terminal: bool = False,
         _store_tail_terminal: bool = False,
         _store_shared_tail: bool = False,
+        _tail_text: str | None = None,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -990,6 +1000,8 @@ class BlockAwarePrefixCache(CacheManager):
                 block; ``tokens`` must end on a snapshot in ``boundary_snapshots``.
             _store_shared_tail: The tail serves many conversations, so keep it
                 out of the tip lineage that discards superseded tails.
+            _tail_text: The tail's detokenized tokens, indexed and persisted
+                beside its hash so a prompt can match the tail by bytes.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -1383,6 +1395,8 @@ class BlockAwarePrefixCache(CacheManager):
                             existing_block.block_hash,
                             len(block_tokens),
                             shared=_store_shared_tail,
+                            text=_tail_text,
+                            token_ids=block_tokens,
                         )
                         tail_in_table = True
                     continue
@@ -1587,6 +1601,11 @@ class BlockAwarePrefixCache(CacheManager):
                         replace_existing=False,
                         parent_hash=parent_hash,
                         tail_terminal=is_tail_terminal,
+                        **(
+                            {"tail_text": _tail_text, "tail_token_ids": block_tokens}
+                            if is_tail_terminal and _tail_text is not None
+                            else {}
+                        ),
                     )
                     if saved:
                         if split_gdn_layout:
@@ -1660,6 +1679,8 @@ class BlockAwarePrefixCache(CacheManager):
                                 block.block_hash,
                                 len(block_tokens),
                                 shared=_store_shared_tail,
+                                text=_tail_text,
+                                token_ids=block_tokens,
                             )
                             self._tail_hashes.add(block.block_hash)
                             if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:

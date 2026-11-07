@@ -28,6 +28,7 @@ import hashlib
 import logging
 import threading
 import time
+from array import array
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -79,6 +80,59 @@ def resolve_block_extra_keys(
 # Tail index bounds. Entries are advisory and verified on every lookup.
 _TAIL_INDEX_PER_PARENT = 8
 _TAIL_INDEX_MAX_PARENTS = 4096
+
+
+def decode_tail_ids(tokenizer: Any, token_ids: List[int]) -> str:
+    """The text of ``token_ids``, special tokens and spacing kept, to match bytes."""
+    try:
+        return tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        return tokenizer.decode(list(token_ids))
+
+
+def normalize_tail_text(text: str) -> str:
+    """The text with trailing spaces and tabs removed from every line, nothing else.
+
+    A client may strip them from a model's text before resending it, so a
+    tail's text is kept, and a prompt's compared, in this form.
+    """
+    return "\n".join(line.rstrip(" \t") for line in text.split("\n"))
+
+
+def _raw_tail_offset(raw: str, length: int) -> int:
+    """The offset in ``raw`` where its normalized text reaches ``length`` characters.
+
+    Normalization only deletes a run of spaces and tabs that ends a line, so
+    one walk maps a normalized length back to the raw text.
+    """
+    kept = i = 0
+    while kept < length and i < len(raw):
+        if raw[i] in " \t":
+            run_end = i
+            while run_end < len(raw) and raw[run_end] in " \t":
+                run_end += 1
+            if run_end == len(raw) or raw[run_end] == "\n":
+                i = run_end  # Deleted by normalization.
+                continue
+            step = min(run_end - i, length - kept)
+            kept += step
+            i += step
+            continue
+        kept += 1
+        i += 1
+    return i
+
+
+def encode_tail_text(tokenizer: Any, text: str) -> List[int]:
+    """Token ids of a text that continues a prompt: no BOS or other added tokens."""
+    try:
+        return list(tokenizer.encode(text, add_special_tokens=False))
+    except TypeError:
+        return list(tokenizer.encode(text))
 
 
 def compute_block_hash(
@@ -581,6 +635,9 @@ class PagedCacheManager(CacheManager):
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
         # Tails shared across conversations, capped apart from ordinary tails.
         self._shared_tails: set[BlockHash] = set()
+        # A tail's text and its own ids, so a prompt that spells the same
+        # bytes with other ids still finds it (match_tail_text).
+        self._tail_texts: Dict[BlockHash, Tuple[str, array]] = {}
 
         logger.info(
             f"PagedCacheManager initialized: block_size={block_size}, "
@@ -1153,11 +1210,16 @@ class PagedCacheManager(CacheManager):
         tail_hash: BlockHash,
         token_count: int,
         shared: bool = False,
+        text: Optional[str] = None,
+        token_ids: Optional[List[int]] = None,
     ) -> None:
         """Index a tail block under its chain parent for later lookup.
 
         Shared tails have their own cap of half the slots, so one-off tails
-        neither evict them nor lose room to them.
+        neither evict them nor lose room to them. ``text`` is the tail's
+        detokenized ``token_ids``, kept normalized (normalize_tail_text); a
+        text with a replacement character (a UTF-8 sequence split at the
+        block boundary) is not kept.
         """
         if token_count <= 0:
             return
@@ -1168,11 +1230,22 @@ class PagedCacheManager(CacheManager):
             ):
                 self._tail_index.clear()
                 self._shared_tails.clear()
+                self._tail_texts.clear()
             tails = self._tail_index.setdefault(parent_hash, OrderedDict())
             tails.pop(tail_hash, None)
             tails[tail_hash] = token_count
             if shared:
                 self._shared_tails.add(tail_hash)
+            if (
+                text
+                and "\ufffd" not in text
+                and token_ids is not None
+                and len(token_ids) == token_count
+            ):
+                self._tail_texts[tail_hash] = (
+                    normalize_tail_text(text),
+                    array("i", token_ids),
+                )
             while len(tails) > _TAIL_INDEX_PER_PARENT:
                 shared = [h for h in tails if h in self._shared_tails]
                 if len(tails) - len(shared) > _TAIL_INDEX_PER_PARENT:
@@ -1183,19 +1256,122 @@ class PagedCacheManager(CacheManager):
                     break
                 del tails[victim]
                 self._shared_tails.discard(victim)
+                self._tail_texts.pop(victim, None)
 
     def is_shared_tail(self, block_hash: Any) -> bool:
         return block_hash in self._shared_tails
 
-    def seed_tail_blocks(
-        self, entries: Iterable[Tuple[Optional[BlockHash], BlockHash, int]]
-    ) -> int:
-        """Rebuild the tail index from persisted block metadata."""
+    def seed_tail_blocks(self, entries: Iterable[Tuple[Any, ...]]) -> int:
+        """Rebuild the tail index from persisted block metadata.
+
+        Each entry is ``(parent_hash, tail_hash, token_count)``, optionally
+        followed by the tail's ``text`` and ``token_ids``.
+        """
         seeded = 0
-        for parent_hash, tail_hash, token_count in entries:
-            self.register_tail_block(parent_hash, tail_hash, token_count)
+        for parent_hash, tail_hash, token_count, *text in entries:
+            self.register_tail_block(
+                parent_hash,
+                tail_hash,
+                token_count,
+                text=text[0] if len(text) > 1 else None,
+                token_ids=text[1] if len(text) > 1 else None,
+            )
             seeded += 1
         return seeded
+
+    def _block_held(self, block_hash: BlockHash) -> bool:
+        """Whether a block is in the block map or the SSD tier. Read-only."""
+        if self.cached_block_hash_to_block.get_block(block_hash) is not None:
+            return True
+        ssd = self._paged_ssd_cache_manager
+        return ssd is not None and ssd.has_block(block_hash)
+
+    def match_tail_text(
+        self,
+        token_ids: List[int],
+        parent_hash: Optional[BlockHash],
+        start: int,
+        tokenizer: Any,
+    ) -> Optional[Tuple[BlockHash, int, List[int]]]:
+        """Find the longest tail under ``parent_hash`` whose text the prompt continues.
+
+        Compares bytes, not ids: the prompt past ``start`` may spell a stored
+        tail's text with other ids (a client re-tokenizing sampled text, or
+        BPE merging across the tail's end). Both sides are compared
+        normalized (normalize_tail_text), since a client may strip trailing
+        spaces from the lines it resends. On a match the prompt's ids are
+        spliced the way a text-keyed checkpoint is resumed: the ids up to
+        ``start``, then the tail's own ids, then the tokenization of the raw
+        text after the tail's bytes alone. The tail's ids keep what the model
+        wrote, so the splice is kept only if it decodes to the same
+        normalized text. Read-only; returns ``(tail_hash, tail_tokens,
+        spliced_ids)`` or None.
+        """
+        with self._lock:
+            tails = self._tail_index.get(parent_hash)
+            candidates = [
+                (tail_hash, length, self._tail_texts[tail_hash])
+                for tail_hash, length in (tails or {}).items()
+                if tail_hash in self._tail_texts
+            ]
+        if not candidates or start >= len(token_ids):
+            return None
+        text = decode_tail_ids(tokenizer, token_ids[start:])
+        if not text or "\ufffd" in text:
+            return None
+        normalized = normalize_tail_text(text)
+        for tail_hash, length, (tail_text, tail_ids) in sorted(
+            candidates, key=lambda c: -len(c[2][0])
+        ):
+            if not normalized.startswith(tail_text) or not self._block_held(
+                tail_hash
+            ):
+                continue
+            rest = text[_raw_tail_offset(text, len(tail_text)) :]
+            spliced = list(tail_ids)
+            if rest:
+                spliced += encode_tail_text(tokenizer, rest)
+            if normalize_tail_text(decode_tail_ids(tokenizer, spliced)) != normalized:
+                continue
+            return tail_hash, length, list(token_ids[:start]) + spliced
+        return None
+
+    def splice_tail_by_text(
+        self, token_ids: List[int], tokenizer: Any
+    ) -> Optional[List[int]]:
+        """The prompt's ids with a stored tail spliced in where only its bytes match.
+
+        Walks the full blocks as get_computed_blocks does, read-only, and
+        returns None when a tail already matches by hash or none matches by
+        text.
+        """
+        with self._lock:
+            if not self._tail_texts:
+                return None
+            parent_hash: Optional[BlockHash] = None
+            start = 0
+            while start + self.block_size <= len(token_ids):
+                block_hash = compute_block_hash(
+                    parent_hash,
+                    token_ids[start : start + self.block_size],
+                    model_name=self.model_name,
+                )
+                if not self._block_held(block_hash):
+                    break
+                parent_hash = block_hash
+                start += self.block_size
+            tails = self._tail_index.get(parent_hash)
+            if not tails or start >= len(token_ids):
+                return None
+            for tail_hash, length in tails.items():
+                if length <= len(token_ids) - start and compute_block_hash(
+                    parent_hash,
+                    token_ids[start : start + length],
+                    model_name=self.model_name,
+                ) == tail_hash and self._block_held(tail_hash):
+                    return None
+        match = self.match_tail_text(token_ids, parent_hash, start, tokenizer)
+        return match[2] if match is not None else None
 
     def _match_tail_block(
         self,
@@ -1237,6 +1413,7 @@ class PagedCacheManager(CacheManager):
                 if ssd is None or not ssd.has_block(tail_hash):
                     tails.pop(tail_hash, None)
                     self._shared_tails.discard(tail_hash)
+                    self._tail_texts.pop(tail_hash, None)
                     if not tails:
                         self._tail_index.pop(parent_hash, None)
                     continue
@@ -1505,6 +1682,7 @@ class PagedCacheManager(CacheManager):
             self.cached_block_hash_to_block.clear()
             self._tail_index.clear()
             self._shared_tails.clear()
+            self._tail_texts.clear()
             if self.on_hash_map_cleared is not None:
                 self.on_hash_map_cleared()
             self.request_tables.clear()

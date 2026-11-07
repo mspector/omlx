@@ -29,6 +29,7 @@ import struct
 import threading
 import time
 import uuid
+from array import array
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ from omlx.utils.formatting import format_bytes
 
 from ..utils.fatal import fatal_exit
 from .interface import CacheManager
+from .paged_cache import normalize_tail_text
 from .pooling_delta import (
     POOLING_CACHE_DELTA_CLASS,
     POOLING_CACHE_DELTA_FORMAT_VERSION,
@@ -1167,6 +1169,9 @@ class PagedSSDBlockMetadata:
     # Chain parent and tail marker; a tail is found through its parent.
     parent_hash: bytes | None = None
     tail_terminal: bool = False
+    # A tail's detokenized text and its own token ids, for the byte match.
+    tail_text: str | None = None
+    tail_token_ids: array | None = None
 
     def touch(self) -> None:
         """Update last access time."""
@@ -1195,6 +1200,9 @@ class PagedSSDBlockMetadata:
             result["parent_hash"] = self.parent_hash.hex()
         if self.tail_terminal:
             result["tail_terminal"] = True
+        if self.tail_text is not None and self.tail_token_ids is not None:
+            result["tail_text"] = self.tail_text
+            result["tail_token_ids"] = list(self.tail_token_ids)
         return result
 
     @classmethod
@@ -1222,6 +1230,16 @@ class PagedSSDBlockMetadata:
                 bytes.fromhex(data["parent_hash"]) if data.get("parent_hash") else None
             ),
             tail_terminal=bool(data.get("tail_terminal", False)),
+            tail_text=(
+                normalize_tail_text(data["tail_text"])
+                if data.get("tail_text") is not None
+                else None
+            ),
+            tail_token_ids=(
+                array("i", data["tail_token_ids"])
+                if data.get("tail_token_ids") is not None
+                else None
+            ),
         )
 
 
@@ -3253,6 +3271,16 @@ class PagedSSDCacheManager(CacheManager):
                     return None
 
             parent_hash_hex = metadata.get("parent_hash", "")
+            tail_text = metadata.get("tail_text")
+            tail_token_ids = None
+            if tail_text is not None:
+                try:
+                    tail_token_ids = array("i", json.loads(metadata["tail_token_ids"]))
+                    # Older tails were saved with the raw text.
+                    tail_text = normalize_tail_text(tail_text)
+                except (KeyError, json.JSONDecodeError, TypeError, ValueError):
+                    # The text is advisory; the block stays usable by hash.
+                    tail_text = None
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),
                 file_path=file_path,
@@ -3268,6 +3296,8 @@ class PagedSSDCacheManager(CacheManager):
                 layer_meta_states=layer_meta_states,
                 parent_hash=bytes.fromhex(parent_hash_hex) if parent_hash_hex else None,
                 tail_terminal=metadata.get("tail_terminal") == "1",
+                tail_text=tail_text,
+                tail_token_ids=tail_token_ids,
             )
         except Exception as e:
             logger.debug(f"Failed to read metadata from {file_path}: {e}")
@@ -3483,6 +3513,8 @@ class PagedSSDCacheManager(CacheManager):
         replace_existing: bool = False,
         parent_hash: bytes | None = None,
         tail_terminal: bool = False,
+        tail_text: str | None = None,
+        tail_token_ids: list[int] | None = None,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -3510,6 +3542,10 @@ class PagedSSDCacheManager(CacheManager):
                 snapshot; normal deduplicated saves must leave it False.
             parent_hash: Chain hash of the preceding block, if any.
             tail_terminal: True for a short terminal block, re-indexed by parent.
+            tail_text: A tail's detokenized text, kept normalized with
+                ``tail_token_ids`` so the tail index can match it by bytes
+                after a restart.
+            tail_token_ids: The tail's own token ids.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -3824,6 +3860,12 @@ class PagedSSDCacheManager(CacheManager):
                 metadata["parent_hash"] = parent_hash.hex()
             if tail_terminal:
                 metadata["tail_terminal"] = "1"
+            if tail_terminal and tail_text is not None and tail_token_ids is not None:
+                tail_text = normalize_tail_text(tail_text)
+                metadata["tail_text"] = tail_text
+                metadata["tail_token_ids"] = json.dumps(list(tail_token_ids))
+            else:
+                tail_text = tail_token_ids = None
 
             # Add cache type information if provided
             if layer_cache_types:
@@ -3884,6 +3926,10 @@ class PagedSSDCacheManager(CacheManager):
                 layer_meta_states=layer_meta_states,
                 parent_hash=parent_hash,
                 tail_terminal=tail_terminal,
+                tail_text=tail_text,
+                tail_token_ids=(
+                    array("i", tail_token_ids) if tail_token_ids is not None else None
+                ),
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
@@ -4637,6 +4683,16 @@ class PagedSSDCacheManager(CacheManager):
             (meta.parent_hash, meta.block_hash, meta.token_count)
             for meta in self._index.get_all_metadata()
             if meta.tail_terminal and meta.token_count > 0
+        ]
+
+    def iter_tail_texts(self) -> list[tuple[bytes, str, array]]:
+        """Return (block_hash, text, token_ids) for indexed tails stored with text."""
+        return [
+            (meta.block_hash, meta.tail_text, meta.tail_token_ids)
+            for meta in self._index.get_all_metadata()
+            if meta.tail_terminal
+            and meta.tail_text is not None
+            and meta.tail_token_ids is not None
         ]
 
     def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:

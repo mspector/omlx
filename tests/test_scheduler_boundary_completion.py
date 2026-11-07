@@ -118,16 +118,16 @@ def test_completed_hybrid_boundary_reuses_final_response(
 
         extended = tokens + [0, 9, 10]
         table, remaining = prefix.fetch_cache("next", extended)
-        # The generator prefilled directly, so no prefill tail was captured;
-        # only an aligned completion boundary is reusable here. Unaligned
-        # replies are not stored: the next turn renders them differently on
-        # reasoning templates.
-        if total_tokens % 4:
+        # The generator prefilled directly, so no prefill snapshot was
+        # captured; the reply is stored to the turn's end from the completed
+        # cache, as a block when aligned and as a tail otherwise. A split
+        # store stops at a full block without its checkpoint, before the tail.
+        if split and total_tokens > 4:
             assert table is None
             assert remaining == extended
         else:
             assert table is not None and table.num_tokens == total_tokens
-            if split:
+            if split and total_tokens % 4 == 0:
                 sidecars = list(
                     (tmp_path / "cache" / "_gdn_sidecars").rglob("*.safetensors")
                 )
@@ -226,13 +226,17 @@ def test_completion_boundary_counts_output_only_when_reasoning_is_preserved(
         (8, {}, True),
         (8, {3: object()}, True),
         (8, {8: object()}, False),
-        (5, {}, False),
+        (5, {}, True),
+        (5, {5: object()}, False),
     ],
 )
 def test_completion_capture_ignores_older_tail_but_stays_aligned(
     mock_model, mock_tokenizer, total_tokens, existing, expected
 ):
-    """A prefill tail below the end must not block the aligned completion capture."""
+    """A prefill tail below the end must not block the completion capture.
+
+    An unaligned end is the turn's end, captured as a tail.
+    """
     scheduler = Scheduler(
         model=mock_model,
         tokenizer=mock_tokenizer,
@@ -262,7 +266,9 @@ def test_completion_capture_ignores_older_tail_but_stays_aligned(
         args = scheduler._on_prefill_boundary_snapshot.call_args.args
         kwargs = scheduler._on_prefill_boundary_snapshot.call_args.kwargs
         assert args[2] == total_tokens
-        assert kwargs["source"] == "completion"
+        assert kwargs["source"] == (
+            "completion" if total_tokens % 4 == 0 else "prefill_tail"
+        )
     scheduler.shutdown()
 
 
