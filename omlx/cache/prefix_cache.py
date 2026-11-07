@@ -1754,7 +1754,11 @@ class BlockAwarePrefixCache(CacheManager):
                     and prev_tip_hash in self._store_tip_hashes
                 ):
                     superseded = self._tip_lineage.pop(prev_tip_hash, None)
-                    if superseded is not None:
+                    if superseded is not None and self._lineage_keeps(superseded):
+                        # Kept for now; a later extension asks again, so an
+                        # unpinned or no longer shared tip still goes.
+                        self._tip_lineage[prev_tip_hash] = superseded
+                    elif superseded is not None:
                         if superseded in self._tail_hashes:
                             self._discard_tail_block(superseded, layer_cache_types)
                         elif rotating_layout:
@@ -2177,6 +2181,19 @@ class BlockAwarePrefixCache(CacheManager):
 
         return 0
 
+    def _lineage_keeps(self, block_hash: bytes) -> bool:
+        """Whether the supersede lineage must leave a tip two stores back alone.
+
+        A pinned tip stays. So does a branch point: a tip another stored tip
+        still descends from, such as a record's turn-end tail that several
+        siblings extended. One branch moving on does not move the others past
+        it, and the lineage only knows the branch it is extending.
+        """
+        is_pinned = getattr(self.paged_ssd_cache, "_is_pinned", None)
+        if callable(is_pinned) and is_pinned(block_hash) is True:
+            return True
+        return any(parent == block_hash for parent in self._tip_lineage.values())
+
     def _discard_tail_block(
         self,
         block_hash: bytes,
@@ -2213,6 +2230,7 @@ class BlockAwarePrefixCache(CacheManager):
                     "Failed to delete superseded tail block %s", block_hash.hex()[:16]
                 )
         self._tail_hashes.discard(block_hash)
+        logger.info("Discarded superseded tail block %s", block_hash.hex()[:16])
         return True
 
     def _strip_rotating_payload(

@@ -1216,7 +1216,8 @@ class PagedCacheManager(CacheManager):
         """Index a tail block under its chain parent for later lookup.
 
         Shared tails have their own cap of half the slots, so one-off tails
-        neither evict them nor lose room to them. ``text`` is the tail's
+        neither evict them nor lose room to them. Pinned tails are never
+        evicted from the index; the caps count the others. ``text`` is the tail's
         detokenized ``token_ids``, kept normalized (normalize_tail_text); a
         text with a replacement character (a UTF-8 sequence split at the
         block boundary) is not kept.
@@ -1228,9 +1229,7 @@ class PagedCacheManager(CacheManager):
                 parent_hash not in self._tail_index
                 and len(self._tail_index) >= _TAIL_INDEX_MAX_PARENTS
             ):
-                self._tail_index.clear()
-                self._shared_tails.clear()
-                self._tail_texts.clear()
+                self._clear_unpinned_tails()
             tails = self._tail_index.setdefault(parent_hash, OrderedDict())
             tails.pop(tail_hash, None)
             tails[tail_hash] = token_count
@@ -1248,15 +1247,39 @@ class PagedCacheManager(CacheManager):
                 )
             while len(tails) > _TAIL_INDEX_PER_PARENT:
                 shared = [h for h in tails if h in self._shared_tails]
+                evictable = [
+                    h for h in tails if h != tail_hash and not self._tail_pinned(h)
+                ]
                 if len(tails) - len(shared) > _TAIL_INDEX_PER_PARENT:
-                    victim = next(h for h in tails if h not in self._shared_tails)
+                    victim = next(
+                        (h for h in evictable if h not in self._shared_tails), None
+                    )
                 elif len(shared) > _TAIL_INDEX_PER_PARENT // 2:
-                    victim = shared[0]
+                    victim = next(
+                        (h for h in evictable if h in self._shared_tails), None
+                    )
                 else:
+                    break
+                if victim is None:
                     break
                 del tails[victim]
                 self._shared_tails.discard(victim)
                 self._tail_texts.pop(victim, None)
+
+    def _tail_pinned(self, block_hash: BlockHash) -> bool:
+        is_pinned = getattr(self._paged_ssd_cache_manager, "_is_pinned", None)
+        return callable(is_pinned) and is_pinned(block_hash) is True
+
+    def _clear_unpinned_tails(self) -> None:
+        """Empty the tail index except for pinned tails. Called with the lock held."""
+        for parent_hash in list(self._tail_index):
+            tails = self._tail_index[parent_hash]
+            for tail_hash in [h for h in tails if not self._tail_pinned(h)]:
+                del tails[tail_hash]
+                self._shared_tails.discard(tail_hash)
+                self._tail_texts.pop(tail_hash, None)
+            if not tails:
+                del self._tail_index[parent_hash]
 
     def is_shared_tail(self, block_hash: Any) -> bool:
         return block_hash in self._shared_tails

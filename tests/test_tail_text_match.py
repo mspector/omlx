@@ -278,6 +278,158 @@ class TestLongestTailWins:
         assert probe["live_prompt_tokens"] == 14
 
 
+
+class TestTipLineageKeepsSharedTails:
+    """The supersede lineage drops a tail two stores back only on a linear chain.
+
+    A pinned tail stays, and so does a branch point: a record's turn-end tail
+    that several siblings extended, when one sibling's own thread moves on.
+    """
+
+    @staticmethod
+    def _state(seq_len, fill):
+        return [
+            {
+                "state": (
+                    mx.full((1, 2, seq_len, 8), fill),
+                    mx.full((1, 2, seq_len, 8), fill),
+                ),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+            },
+            {
+                "state": (mx.full((1, 3, 8), fill), mx.full((1, 2, 4, 8), fill)),
+                "cache_type": "ArraysCache",
+                "class_name": "ArraysCache",
+            },
+        ]
+
+    def _fixture(self):
+        from unittest.mock import MagicMock
+
+        from test_prefix_cache import MockModel
+
+        from omlx.cache.hybrid_cache import ModelCacheConfig
+
+        paged = PagedCacheManager(
+            block_size=4, max_blocks=200, initial_blocks=200, model_name="m"
+        )
+        ssd = MagicMock()
+        ssd.save_block.return_value = True
+        ssd.has_block.return_value = False
+        ssd.iter_tail_blocks.return_value = []
+        self.pins = set()
+        ssd._is_pinned = lambda block_hash: block_hash in self.pins
+        paged.set_paged_ssd_cache_manager(ssd)
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=2),
+            paged_cache_manager=paged,
+            paged_ssd_cache_manager=ssd,
+        )
+        config = ModelCacheConfig.from_type_list(
+            ["KVCache", "ArraysCache"], model_name="m"
+        )
+
+        def turn(request_id, tokens):
+            """Look the request up, then store it through its own tail."""
+            n = len(tokens)
+            boundary = (n // 4) * 4
+            cache.fetch_cache(request_id, tokens)
+            table = cache.store_cache(
+                request_id,
+                tokens,
+                self._state(n, float(n)),
+                model_cache_config=config,
+                boundary_snapshots={
+                    boundary: self._state(boundary, float(boundary)),
+                    n: self._state(n, float(n)),
+                },
+                _store_tail_terminal=True,
+            )
+            paged.release_for_eviction(table.block_ids)
+            return paged.allocated_blocks[table.block_ids[-1]].block_hash
+
+        return paged, cache, turn
+
+    @staticmethod
+    def _held(paged, tail_hash):
+        return paged.cached_block_hash_to_block.get_block(tail_hash) is not None
+
+    @staticmethod
+    def _probe_paged(paged, token_ids):
+        scheduler = SimpleNamespace(
+            block_aware_cache=SimpleNamespace(block_size=4),
+            paged_ssd_cache_manager=None,
+            paged_cache_manager=paged,
+            config=SimpleNamespace(paged_cache_block_size=4),
+        )
+        return _probe(scheduler, token_ids)
+
+    def test_pinned_record_tails_survive_sibling_churn(self):
+        paged, cache, turn = self._fixture()
+        record = list(range(7))
+        ask_1 = turn("ask-1", record[:5])
+        ask_2 = turn("ask-2", record)
+        parent = compute_block_hash(None, record[:4], model_name="m")
+        assert set(paged._tail_index[parent]) == {ask_1, ask_2}
+        self.pins.update({ask_1, ask_2})
+
+        # Twelve siblings of the first ask put their tails under the same
+        # parent, past the per-parent cap of 8; twelve siblings of the second
+        # ask extend its tail and diverge, and one of them moves on.
+        for i in range(12):
+            turn(f"sibling-1-{i}", record[:5] + [100 + i, 101])
+        siblings = [record + [120 + i, 50, 51] for i in range(12)]
+        for i, tokens in enumerate(siblings):
+            turn(f"sibling-2-{i}", tokens)
+        turn("sibling-2-0-next", siblings[0] + [60, 61, 62, 63])
+
+        for tail in (ask_1, ask_2):
+            assert self._held(paged, tail)
+            assert tail in paged._tail_index[parent]
+        table, _ = cache.fetch_cache("next-ask", record + [200])
+        assert table.num_tokens == 7
+        cache.release_cache("next-ask")
+        table, _ = cache.fetch_cache("fold", record[:5] + [300])
+        assert table.num_tokens == 5
+        cache.release_cache("fold")
+        assert self._probe_paged(paged, record + [200])["live_hit_tokens"] == 7
+
+    def test_unpinned_linear_chain_still_drops_the_tail_two_back(self):
+        paged, cache, turn = self._fixture()
+        tail_1 = turn("turn-1", list(range(7)))
+        turn("turn-2", list(range(11)))
+        turn("turn-3", list(range(15)))
+        assert not self._held(paged, tail_1)
+
+    def test_unpinning_makes_a_kept_tail_discardable_again(self):
+        paged, cache, turn = self._fixture()
+        tail_1 = turn("turn-1", list(range(7)))
+        self.pins.add(tail_1)
+        turn("turn-2", list(range(11)))
+        turn("turn-3", list(range(15)))
+        assert self._held(paged, tail_1)
+
+        self.pins.clear()
+        # An edit of turn 3 extends turn 2's tail again.
+        turn("turn-3-edited", list(range(11)) + [90, 91, 92, 93])
+        assert not self._held(paged, tail_1)
+
+    def test_unpinned_branch_point_survives_a_siblings_thread(self):
+        """The GLM shape: no pin, but two siblings extended the record's tail."""
+        paged, cache, turn = self._fixture()
+        turn("ask-1", list(range(7)))
+        ask_2 = turn("ask-2", list(range(11)))
+        sibling = list(range(11)) + [90, 91]
+        turn("sibling-a", sibling)
+        turn("sibling-b", list(range(11)) + [80, 81])
+        turn("sibling-a-next", sibling + [1, 2, 3, 4])
+
+        assert self._held(paged, ask_2)
+        table, _ = cache.fetch_cache("sibling-c", list(range(11)) + [70])
+        assert table.num_tokens == 11
+        cache.release_cache("sibling-c")
+
 @pytest.mark.parametrize("raw_on_disk", [False, True])
 def test_tail_text_persists_across_a_rescan(tmp_path, raw_on_disk):
     """The text and ids are saved with the tail's metadata and seed the index.
