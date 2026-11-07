@@ -7803,6 +7803,25 @@ async def probe_cache(
     # hashes line up with what the scheduler would produce at prefill.
     try:
         messages = _normalize_probe_tool_calls(request.messages)
+        # The chat route reshapes messages before the template: it inlines
+        # or strips a turn's reasoning_content as the template expects and
+        # extracts text content. A probe of the raw messages renders a
+        # different prompt and hashes blocks that were never stored.
+        try:
+            from ..api.openai_models import ChatCompletionRequest
+            from ..server import _extract_chat_messages
+
+            shaped = _extract_chat_messages(
+                ChatCompletionRequest(
+                    model=request.model_id, messages=messages, tools=request.tools
+                ),
+                engine,
+                request.model_id,
+                None,
+            )
+            messages = shaped.messages
+        except Exception as exc:
+            logger.debug("Probe falls back to raw messages: %s", exc)
         if hasattr(engine, "_preprocess_messages"):
             messages = engine._preprocess_messages(messages)
         try:
