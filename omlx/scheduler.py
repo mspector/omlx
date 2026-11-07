@@ -10221,7 +10221,9 @@ class Scheduler:
         after a normal streaming token response. That response has no
         ``prompt_cache``, so the usual final-response cache extraction never runs.
         This fallback stores the prompt, plus the output when the next turn
-        keeps it (``_output_tokens_cacheable``), up to a block boundary.
+        keeps it (``_output_tokens_cacheable``), up to a block boundary, or to
+        the turn's end when the live row holds exactly the turn
+        (``_capture_parser_stop_turn_end``).
         """
         if self.block_aware_cache is None:
             return None
@@ -10240,6 +10242,9 @@ class Scheduler:
             ]
         elif folded_output_tokens:
             prompt_tokens = prompt_tokens[:-folded_output_tokens]
+        turn_tokens = self._capture_parser_stop_turn_end(request_id, request, uid)
+        if turn_tokens is not None:
+            prompt_tokens = turn_tokens
         boundary_override = self._get_boundary_store_override(request_id, prompt_tokens)
         if boundary_override is not None:
             (
@@ -10316,7 +10321,11 @@ class Scheduler:
         if self._detect_boundary_snapshot_need():
             return None
 
-        boundary_len = (len(prompt_tokens) // block_size) * block_size
+        boundary_len = (
+            len(prompt_tokens)
+            if turn_tokens is not None
+            else (len(prompt_tokens) // block_size) * block_size
+        )
         if boundary_len <= 0:
             return None
 
@@ -10338,6 +10347,28 @@ class Scheduler:
             )
             return None
 
+        if turn_tokens is not None:
+            logger.info(
+                "Using live prompt cache for %s: storing %s tokens to the turn's "
+                "end after scheduler-side stop",
+                request_id,
+                len(token_sequence),
+            )
+            # Every layer slices, so the live cache holds the tail at the
+            # turn's end without a snapshot.
+            snapshots = (
+                _BoundarySnapshotProvider(
+                    store=None,
+                    request_id=request_id,
+                    valid_tcs=[],
+                    in_memory_snapshots={},
+                    tail_terminal_token_count=boundary_len,
+                )
+                if boundary_len % block_size
+                else None
+            )
+            return token_sequence, live_cache, live_model_config, snapshots
+
         logger.info(
             "Using live prompt cache for %s: storing %s/%s prompt tokens after "
             "scheduler-side stop (skipping output tokens)",
@@ -10346,6 +10377,88 @@ class Scheduler:
             len(prompt_tokens),
         )
         return token_sequence, live_cache, live_model_config, None
+
+    def _capture_parser_stop_turn_end(
+        self, request_id: str, request: Request, uid: int
+    ) -> list[int] | None:
+        """Snapshot the live row at the turn's end after a parser stop.
+
+        The parser stops on its closing tag, so the row's cache holds the
+        prompt, the recorded output and, when the parser did not record it,
+        the token that completed the tag (``stop_token_id``). Whatever the
+        template renders after the tag falls into the next prompt's suffix.
+        When the live tokens and the cache offset hold exactly that turn, with
+        nothing fed past it (no speculative run-ahead), it is registered as
+        the tail snapshot at that count, as _capture_finished_boundary_snapshot
+        does for a stop finish. Returns the turn's tokens, or None to keep the
+        boundary store.
+        """
+        generator = getattr(self, "batch_generator", None)
+        if (
+            generator is None
+            or uid is None
+            or uid < 0
+            or getattr(request, "skip_cache_store", False)
+            or not _output_tokens_cacheable(request)
+            or not getattr(request, "output_token_ids", None)
+            or _request_count(request, "requeued_output_tokens")
+            or (
+                (getattr(request, "generation_prompt_start", 0) or 0) > 0
+                and not getattr(request, "generation_prompt_persists", False)
+            )
+        ):
+            return None
+        turn = list(request.prompt_token_ids) + list(request.output_token_ids)
+        try:
+            _safe_sync_stream(self._stream)
+            with mx.stream(self._stream):
+                live_cache, live_tokens = generator.extract_cache([uid])[uid]
+        except Exception as e:
+            logger.debug("Parser-stop turn end unavailable for %s: %s", request_id, e)
+            return None
+        live = list(live_tokens) if live_tokens is not None else []
+        offsets = {
+            offset
+            for layer in live_cache or []
+            if (offset := _first_leaf_cache_offset(layer)) is not None
+        }
+        stop = getattr(request, "stop_token_id", None)
+        expected = turn + [stop] if isinstance(stop, int) else turn
+        if offsets != {len(expected)} or live != expected:
+            logger.debug(
+                "Parser-stop turn end not stored for %s: the live row holds %d "
+                "tokens at offsets %s, the turn %d",
+                request_id,
+                len(live),
+                sorted(offsets),
+                len(expected),
+            )
+            return None
+        request.turn_end_tokens = len(expected)
+        if self._detect_boundary_snapshot_need():
+            if len(expected) % self.config.paged_cache_block_size:
+                self._on_prefill_boundary_snapshot(
+                    request_id,
+                    [
+                        c
+                        if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES
+                        else None
+                        for c in live_cache
+                    ],
+                    len(expected),
+                    source=_TAIL_SNAPSHOT_SOURCE,
+                )
+            else:
+                self._on_prefill_boundary_snapshot(
+                    request_id,
+                    live_cache,
+                    len(expected),
+                    source="completion",
+                    snapshot_block_size=self._boundary_snapshot_block_size(
+                        request, len(expected)
+                    ),
+                )
+        return expected
 
     def _validate_cache(self, cache: Any) -> bool:
         """
@@ -14334,6 +14447,10 @@ class Scheduler:
                 )
                 if should_record_token or ignore_parser_stop:
                     request.append_output_token(response.token)
+                elif parser_result.is_stop and isinstance(response.token, int):
+                    # The token that completed the parser's stop is fed into
+                    # the cache but not kept as output.
+                    request.stop_token_id = response.token
 
             elif not is_stop:
                 # Standard processing without a protocol parser

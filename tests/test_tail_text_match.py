@@ -22,13 +22,19 @@ from omlx.cache.paged_cache import (
     normalize_tail_text,
 )
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+from omlx.adapter.output_parser import (
+    OutputParserFinalizeResult,
+    OutputParserTokenResult,
+)
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig
 
 # Single letters and a few merges, so one text has several id spellings.
-_VOCAB = [chr(ord("a") + i) for i in range(26)] + ["ab", "cd", "<eos>", " ", "ba", "\n"]
+_VOCAB = [chr(ord("a") + i) for i in range(26)]
+_VOCAB += ["ab", "cd", "<eos>", " ", "</c>", "\n"]
 EOS = _VOCAB.index("<eos>")
+CLOSE = _VOCAB.index("</c>")
 
 
 class TextTokenizer:
@@ -569,6 +575,152 @@ def test_turn_end_tail_follows_the_requests_persistence(tmp_path, persists):
         else:
             assert request.turn_end_tokens == 0
             assert not paged._tail_texts
+    finally:
+        scheduler.shutdown()
+
+class _ClosingTagParser:
+    """Stops on a closing tag and records it, as V4.1's DSML parser does."""
+
+    def __init__(self, record_stop=True):
+        self.record_stop = record_stop
+        self.stopped = False
+
+    def process_token(self, token_id):
+        if self.stopped:
+            return OutputParserTokenResult(is_stop=True, record_token=False)
+        self.stopped = token_id == CLOSE
+        text = _VOCAB[token_id]
+        return OutputParserTokenResult(
+            stream_text=text,
+            visible_text=text,
+            is_stop=self.stopped,
+            record_token=self.record_stop or not self.stopped,
+        )
+
+    def finalize(self):
+        return OutputParserFinalizeResult()
+
+
+def _finish_tool_turn(scheduler, prompt, sampled, advance=False, record_stop=True):
+    """Generate ``sampled`` up to the closing tag, which the parser stops on.
+
+    The response carries no cache, so the store takes the parser-stop path.
+    ``advance`` feeds one more token into the row before the store.
+    """
+    script = iter(sampled + ([_VOCAB.index("x")] if advance else []) + [EOS])
+
+    def sampler(logprobs):
+        return mx.full(logprobs.shape[:-1], next(script, 0), dtype=mx.int32)
+
+    generator = BatchGenerator(
+        scheduler.model,
+        max_tokens=16,
+        stop_tokens=[[EOS]],
+        sampler=sampler,
+        stream=scheduler._stream,
+    )
+    scheduler.batch_generator = generator
+    parser = _ClosingTagParser(record_stop)
+    scheduler._get_output_parser_session = lambda request_id: parser
+    request = Request(
+        request_id="tool-turn",
+        prompt=list(prompt),
+        sampling_params=SamplingParams(max_tokens=16),
+    )
+    scheduler.add_request(request)
+    scheduler.waiting.clear()
+    scheduler.running[request.request_id] = request
+    uid = generator.insert([list(prompt)])[0]
+    scheduler.request_id_to_uid[request.request_id] = uid
+    scheduler.uid_to_request_id[uid] = request.request_id
+    finished = set()
+    for _ in range(10):
+        _, responses = generator.next()
+        if responses:
+            _, finished = scheduler._process_batch_responses(responses)
+            if finished:
+                break
+    assert finished == {request.request_id}
+    if advance:
+        generator.next()
+    scheduler._cleanup_finished(finished)
+    for future in list(scheduler._inflight_store_futures.values()):
+        future.result(timeout=30)
+    scheduler._drain_pending_async_removes()
+    return request
+
+
+@pytest.mark.parametrize("kind", ["gdn", "kv"])
+@pytest.mark.parametrize("record_stop", [True, False])
+def test_parser_stop_stores_a_turn_end_tail_at_the_closing_tag(
+    tmp_path, kind, record_stop
+):
+    """A tool-call turn ends on the parser's closing tag; the tail ends there,
+    and the next prompt, which renders an end-of-sentence token and the tool
+    result after the tag, matches it by bytes, splices and restores exactly."""
+    model, scheduler, paged, ssd, prefix = _rig(tmp_path, kind)
+    try:
+        prompt = TOK.encode("efgha")
+        request = _finish_tool_turn(
+            scheduler, prompt, [_VOCAB.index("b"), CLOSE], record_stop=record_stop
+        )
+        assert request.output_token_ids == (
+            [_VOCAB.index("b"), CLOSE] if record_stop else [_VOCAB.index("b")]
+        )
+        assert request.turn_end_tokens == 7
+        turn = prompt + [_VOCAB.index("b"), CLOSE]
+        parent = compute_block_hash(None, turn[:4], model_name="tiny-qwen")
+        tail_hash = compute_block_hash(parent, turn[4:], model_name="tiny-qwen")
+        assert paged._tail_texts[tail_hash][0] == "ab</c>"
+
+        # The client resends the parsed call; "ab" re-tokenizes as one id.
+        resent = TOK.encode("efghab</c><eos>cd")
+        spliced = turn + [EOS, _VOCAB.index("cd")]
+        assert _probe(scheduler, resent)["live_hit_tokens"] == 7
+
+        next_request = Request(
+            request_id="tool-result",
+            prompt=list(resent),
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        scheduler.add_request(next_request)
+        scheduler._prepare_prefix_cache_for_request(next_request)
+        assert next_request.prompt_token_ids == spliced
+        assert next_request.cached_tokens == 7
+        scheduler._release_paged_cache_for_request(next_request.request_id)
+
+        table, remaining = prefix.fetch_cache("tool-result", spliced)
+        assert table is not None and table.num_tokens == 7
+        restored = prefix.reconstruct_cache(table)
+        with mx.stream(scheduler._stream):
+            warm = model(mx.array([remaining]), cache=restored)[:, -1]
+            cold = model(mx.array([spliced]), cache=model.make_cache())[:, -1]
+            mx.eval(warm, cold)
+        assert mx.allclose(warm, cold, atol=1e-4)
+        prefix.release_cache("tool-result")
+    finally:
+        scheduler.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["gdn", "kv"])
+def test_parser_stop_with_an_advanced_row_keeps_the_boundary_store(
+    tmp_path, caplog, kind
+):
+    """A row fed past the closing tag no longer holds the turn: no tail."""
+    model, scheduler, paged, ssd, prefix = _rig(tmp_path, kind)
+    try:
+        with caplog.at_level("DEBUG", logger="omlx.scheduler"):
+            request = _finish_tool_turn(
+                scheduler, TOK.encode("efgha"), [_VOCAB.index("b"), CLOSE], advance=True
+            )
+        assert request.turn_end_tokens == 0
+        assert not paged._tail_texts
+        assert "Parser-stop turn end not stored" in caplog.text
+        if kind == "kv":
+            # Today's boundary store: the full block, nothing past it.
+            table, remaining = prefix.fetch_cache("probe", TOK.encode("efghab"))
+            assert table is not None and table.num_tokens == 4
+            prefix.release_cache("probe")
     finally:
         scheduler.shutdown()
 
